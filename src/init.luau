@@ -1,3 +1,5 @@
+--!native
+
 export type OutputCallback = (number) -> ()
 export type InputCallback = () -> number
 
@@ -14,6 +16,9 @@ local function into_buffer(input: IntoBuffer): buffer
 	return if type(input) == "string" then buffer.fromstring(input) else input
 end
 
+local DEFAULT_MEMORY_SIZE = 65536
+local MEMORY_EXPANDS_BY = 4096
+
 local ADVANCE = string.byte(">") -- 0x3E
 local RETREAT = string.byte("<") -- 0x3C
 local INCREMENT = string.byte("+") -- 0x2B
@@ -21,10 +26,8 @@ local DECREMENT = string.byte("-") -- 0x2D
 local OUTPUT = string.byte(".") -- 0x2E
 local INPUT = string.byte(",") -- 0x2C
 local LOOP_BEGIN = string.byte("[") -- 0x5B
-local JUMPIFZ = LOOP_BEGIN
-local LOOP_END = string.byte("]") -- 0x5D
-local JUMPIFNZ = LOOP_END
 local NEWLINE = string.byte("\n")
+local LOOP_END = string.byte("]") -- 0x5D
 
 export type Location = {
 	line: number,
@@ -90,7 +93,22 @@ local function get_location(src: buffer, position: number): Location
 	}
 end
 
+local function trim_buffer(src: buffer, size: number): buffer
+	local dst = buffer.create(size)
+	buffer.copy(dst, 0, src, 0, size)
+	return dst
+end
+
 local brainf = {}
+
+local OP_ADVANCE = 0x3E
+local OP_RETREAT = 0x3C
+local OP_INCREMENT = 0x2B
+local OP_DECREMENT = 0x2D
+local OP_OUTPUT = 0x2E
+local OP_INPUT = 0x2C
+local OP_JUMPIFZ = 0x5B
+local OP_JUMPIFNZ = 0x5D
 
 --[=[
     Compiles the given brainf source into a compact intermediate representation.
@@ -182,8 +200,7 @@ function brainf.compile(src: IntoBuffer): buffer
 	end
 
 	local ir_len = temp_cursor
-	local ir = buffer.create(ir_len)
-	buffer.copy(ir, 0, temp, 0, ir_len)
+	local ir = trim_buffer(temp, ir_len)
 
 	local cursor = 0
 
@@ -216,6 +233,79 @@ function brainf.compile(src: IntoBuffer): buffer
 	end
 
 	return ir
+end
+
+function brainf.run(src: IntoBuffer, callbacks: RunCallbacks)
+	local src = into_buffer(src)
+	local validation_result = brainf.validate(src)
+	if not validation_result.ok then
+		error(`syntax error`)
+	end
+
+	local instructions = brainf.compile(src)
+
+	local instruction_pointer = 0
+	local instruction_count = buffer.len(instructions)
+	local memory = buffer.create(DEFAULT_MEMORY_SIZE)
+	local memory_size = DEFAULT_MEMORY_SIZE
+
+	local data_pointer = 0
+
+	while instruction_pointer < instruction_count do
+		local insn = buffer.readu8(instructions, instruction_pointer)
+		instruction_pointer += 1
+		if not is_syntax(insn) then
+			continue
+		end
+
+		if insn == OP_ADVANCE then
+			data_pointer += buffer.readu8(instructions, instruction_pointer)
+			instruction_pointer += 1
+
+			if data_pointer > memory_size then
+				memory_size += MEMORY_EXPANDS_BY
+				local new_memory = buffer.create(memory_size)
+				buffer.copy(new_memory, 0, memory)
+				memory = new_memory
+			end
+		elseif insn == OP_RETREAT then
+			data_pointer -= buffer.readu8(instructions, instruction_pointer)
+			instruction_pointer += 1
+
+			if data_pointer < 0 then
+				error({
+					type = "out_of_bounds",
+					location = get_location(src, data_pointer),
+				})
+			end
+		elseif insn == OP_INCREMENT then
+			local amount = buffer.readu8(instructions, instruction_pointer)
+			buffer.writeu8(memory, data_pointer, buffer.readu8(memory, data_pointer) + amount)
+			instruction_pointer += 1
+		elseif insn == OP_DECREMENT then
+			local amount = buffer.readu8(instructions, instruction_pointer)
+			buffer.writeu8(memory, data_pointer, buffer.readu8(memory, data_pointer) - amount)
+			instruction_pointer += 1
+		elseif insn == OP_OUTPUT then
+			callbacks.output(buffer.readu8(memory, data_pointer))
+		elseif insn == OP_INPUT then
+			buffer.writeu8(memory, data_pointer, callbacks.input())
+		elseif insn == OP_JUMPIFZ then
+			if buffer.readu8(memory, data_pointer) == 0 then
+				instruction_pointer = buffer.readu32(instructions, instruction_pointer)
+			else
+				instruction_pointer += 4
+			end
+		elseif insn == OP_JUMPIFNZ then
+			if buffer.readu8(memory, data_pointer) ~= 0 then
+				instruction_pointer = buffer.readu32(instructions, instruction_pointer)
+			else
+				instruction_pointer += 4
+			end
+		else
+			error(`unexpected instruction {string.char(insn)}, did stripping fail?`)
+		end
+	end
 end
 
 function brainf.transpile(src: IntoBuffer): string
@@ -286,72 +376,6 @@ function brainf.transpile(src: IntoBuffer): string
 	write("end\n")
 
 	return table.concat(buf, "")
-end
-
-function brainf.run(src: IntoBuffer, callbacks: RunCallbacks)
-	local src = into_buffer(src)
-	local validation_result = brainf.validate(src)
-	if not validation_result.ok then
-		error(`syntax error`)
-	end
-
-	local instructions = brainf.compile(src)
-
-	local instruction_pointer = 0
-	local instruction_count = buffer.len(instructions)
-	local memory = setmetatable(table.create(30000, 0), {
-		__index = function(self, idx)
-			return rawget(self, idx) or 0
-		end,
-	})
-
-	local data_pointer = 0
-
-	while instruction_pointer < instruction_count do
-		local insn = buffer.readu8(instructions, instruction_pointer)
-		instruction_pointer += 1
-		if not is_syntax(insn) then
-			continue
-		end
-
-		if insn == ADVANCE then
-			data_pointer += buffer.readu8(instructions, instruction_pointer)
-			instruction_pointer += 1
-		elseif insn == RETREAT then
-			data_pointer -= buffer.readu8(instructions, instruction_pointer)
-			instruction_pointer += 1
-			if data_pointer < 0 then
-				error({
-					type = "out_of_bounds",
-					location = get_location(src, data_pointer),
-				})
-			end
-		elseif insn == INCREMENT then
-			memory[data_pointer] = (memory[data_pointer] + buffer.readu8(instructions, instruction_pointer)) % 256
-			instruction_pointer += 1
-		elseif insn == DECREMENT then
-			memory[data_pointer] = (memory[data_pointer] - buffer.readu8(instructions, instruction_pointer)) % 256
-			instruction_pointer += 1
-		elseif insn == OUTPUT then
-			callbacks.output(memory[data_pointer])
-		elseif insn == INPUT then
-			memory[data_pointer] = callbacks.input()
-		elseif insn == JUMPIFZ then
-			if memory[data_pointer] == 0 then
-				instruction_pointer = buffer.readu32(instructions, instruction_pointer)
-			else
-				instruction_pointer += 4
-			end
-		elseif insn == JUMPIFNZ then
-			if memory[data_pointer] ~= 0 then
-				instruction_pointer = buffer.readu32(instructions, instruction_pointer)
-			else
-				instruction_pointer += 4
-			end
-		else
-			error(`unexpected instruction {string.char(insn)}, did stripping fail?`)
-		end
-	end
 end
 
 function brainf.wrap(src: IntoBuffer): BrainfFunction
@@ -438,6 +462,9 @@ function brainf.validate(src: IntoBuffer): ValidationResult
 	end
 end
 
+--[=[
+	Strips unnecessary characters from a brainf source text. 
+]=]
 function brainf.strip(src: IntoBuffer): buffer
 	local src = into_buffer(src)
 	local src_len = buffer.len(src)
@@ -455,9 +482,7 @@ function brainf.strip(src: IntoBuffer): buffer
 		end
 	end
 
-	local ir = buffer.create(write_cursor)
-	buffer.copy(ir, 0, temp, 0, write_cursor)
-	return ir
+	return trim_buffer(temp, write_cursor)
 end
 
 return brainf
